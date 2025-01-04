@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "visoraai-2"
+version = "0.1.0"
+description = ""
+authors = ["Arihant Ujjwal"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "3.9.6"
+pytesseract = "^0.3.13"
+opencv-python = "^4.10.0.84"
+simpleaudio = "^1.0.4"
+gtts = "^2.5.4"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

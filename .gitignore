@@ -1,0 +1,5 @@
+static_files/
+tests/
+.venv/
+.env/
+test.txt
