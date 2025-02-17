@@ -3,3 +3,4 @@ tests/
 .venv/
 .env/
 test.txt
+outputs/*.mp3
