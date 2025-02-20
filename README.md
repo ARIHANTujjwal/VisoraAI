@@ -42,3 +42,11 @@ VisoraAI is a Python-based project designed to help visually impaired users read
    ```bash
    git clone https://github.com/yourusername/VisoraAI.git
    cd VisoraAI
+
+### How to run:
+poetry run python3 visora_ai.py  
+
+### Git push:
+git add --all
+git commit -m "(change details)"
+git push -u origin main
