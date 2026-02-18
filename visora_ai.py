@@ -10,7 +10,8 @@
 #   This script auto-sets DISPLAY=:0 if it looks missing, unless VISORA_HEADLESS=1.
 #
 # Camera:
-#   Uses /dev/video0 explicitly and forces MJPG @ 1920x1080 30fps.
+#   Uses /dev/video0 explicitly and forces MJPG @ 1280x720 30fps by default (more stable than 1080p).
+#   Override with: VISORA_W=1920 VISORA_H=1080 VISORA_FPS=30
 
 import cv2
 import time
@@ -208,7 +209,7 @@ def open_cam():
     """
     Reliable V4L2 open for Pi USB cams.
     Default: /dev/video0, MJPG, 1280x720@30 (less likely to stall than 1080p).
-    You can override with:
+    Override with:
       VISORA_CAM_DEV=/dev/video0
       VISORA_W=1920 VISORA_H=1080 VISORA_FPS=30
     """
@@ -339,6 +340,9 @@ class FrameGrabber:
                 time.sleep(0.03)
 
     def get(self, max_age_sec=0.7):
+        """
+        Returns: (frame_or_None, seq_int, timestamp_float)
+        """
         with self.lock:
             f = self.latest
             t = self.latest_time
@@ -681,6 +685,7 @@ def median_stack(grays: List[np.ndarray]) -> Optional[np.ndarray]:
     stack = np.stack(arr, axis=0)
     return np.median(stack, axis=0).astype(np.uint8)
 
+
 def _grabber_next_frame(grabber: FrameGrabber, last_seq: int, timeout_sec: float = 0.6):
     """
     Waits briefly for a *new* frame (seq changes). Returns (frame, seq) or (None, last_seq).
@@ -748,92 +753,6 @@ def capture_best_text_via_box_data_from_grabber(grabber: FrameGrabber, seconds: 
         max_frames -= 1
         frame, last_seq = _grabber_next_frame(grabber, last_seq, timeout_sec=0.5)
         if frame is None:
-            continue
-
-        _, text_detected, _, _, _, word_boxes = detect_text_and_draw_box(frame)
-        if not text_detected or not word_boxes:
-            continue
-
-        crop, rect = crop_union_of_word_boxes_tight(frame, word_boxes, pad=14, trim_quantile=0.10)
-        if crop is None:
-            continue
-
-        sharp = blur_score(crop)
-        over = overexposure_fraction(crop)
-        if over > 0.35 or sharp < 45:
-            continue
-
-        gray = enhance_text_crop_to_gray(crop)
-        gray_pool.append(gray)
-        if len(gray_pool) > 13:
-            gray_pool.pop(0)
-
-        n = len(word_boxes)
-        score = (n * 1200.0) + min(sharp, 2600.0) - (over * 1500.0)
-
-        if score > best_score:
-            best_score = score
-            best_crop = crop
-            best_rect = rect
-
-    super_gray = median_stack(gray_pool)
-    return best_crop, best_rect, super_gray
-
-# =========================
-# Burst scan (ADD tiny sleeps on failed reads)
-# =========================
-def capture_best_text_block(cap, seconds: float = 1.25, max_frames: int = 34):
-    start = time.time()
-    best_crop = None
-    best_rect = None
-    best_score = -1e18
-    gray_pool: List[np.ndarray] = []
-
-    while (time.time() - start) < seconds and max_frames > 0:
-        max_frames -= 1
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.01)
-            continue
-
-        crop, rect = crop_full_text_block(frame)
-        if crop is None:
-            continue
-
-        sharp = blur_score(crop)
-        over = overexposure_fraction(crop)
-        if over > 0.35 or sharp < 45:
-            continue
-
-        gray = enhance_text_crop_to_gray(crop)
-        gray_pool.append(gray)
-        if len(gray_pool) > 13:
-            gray_pool.pop(0)
-
-        h, w = crop.shape[:2]
-        score = min(sharp, 3200.0) + (w * h) * 1e-5 - (over * 1800.0)
-
-        if score > best_score:
-            best_score = score
-            best_crop = crop
-            best_rect = rect
-
-    super_gray = median_stack(gray_pool)
-    return best_crop, best_rect, super_gray
-
-
-def capture_best_text_via_box_data(cap, seconds: float = 1.25, max_frames: int = 34):
-    start = time.time()
-    best_crop = None
-    best_rect = None
-    best_score = -1e18
-    gray_pool: List[np.ndarray] = []
-
-    while (time.time() - start) < seconds and max_frames > 0:
-        max_frames -= 1
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.01)
             continue
 
         _, text_detected, _, _, _, word_boxes = detect_text_and_draw_box(frame)
@@ -954,12 +873,7 @@ def main():
     speaker.say("Visora AI is starting.", force=True)
 
     # Open camera FIRST (prevents scan/quit confusion if camera stalls)
-    try:
-        grabber = FrameGrabber(open_cam, speaker=speaker)
-    except Exception as e:
-        print(f"[Camera] Failed to open: {e}")
-        speaker.say("Camera failed to open.", force=True)
-        return
+    grabber = FrameGrabber(open_cam, speaker=speaker)
 
     # Start console AFTER camera is ready
     console = ConsoleControls()
@@ -1001,9 +915,6 @@ def main():
     autoscan_t0 = None
     last_scan_time = 0.0
 
-    consecutive_fail = 0
-    MAX_FAIL = 40
-
     while True:
         if console.should_quit():
             break
@@ -1011,9 +922,10 @@ def main():
         if console.consume_scan():
             scan_requested = True
 
-        frame = grabber.get(max_age_sec=0.7)
+        # IMPORTANT: grabber.get returns (frame, seq, ts)
+        frame, _, _ = grabber.get(max_age_sec=0.7)
+
         if frame is None:
-            # no fresh frame yet; don’t block, just loop
             time.sleep(0.02)
             continue
 
@@ -1106,7 +1018,7 @@ def main():
             if best_rect is not None and last_processed is not None:
                 x1, y1, x2, y2 = best_rect
                 cv2.rectangle(last_processed, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                display_frame = last_processed    
+                display_frame = last_processed
 
             if best_crop is None or super_gray is None:
                 speaker.say("I can't see text yet. Move closer and aim at the paragraph.", force=True)
