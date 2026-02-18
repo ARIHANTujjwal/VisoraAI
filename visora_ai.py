@@ -207,41 +207,40 @@ def _try_set_manual_camera(cap: cv2.VideoCapture):
 
 def open_cam():
     """
-    Uses explicit device path for reliability on Pi.
-    Default: /dev/video0 (your Arducam_8mp).
+    Pi: Use GStreamer pipeline for stable capture (avoids OpenCV V4L2 select() timeouts).
+    Mac: use AVFoundation.
     """
     if sys.platform == "darwin":
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-    else:
-        dev = os.environ.get("VISORA_CAM_DEV", "/dev/video0")
-        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        _try_set_manual_camera(cap)
+        return cap
 
-        # Force MJPG (your device supports MJPG 1280x720@30)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    # ---------- Raspberry Pi (Linux) ----------
+    dev = os.environ.get("VISORA_CAM_DEV", "/dev/video0")
+    W = int(os.environ.get("VISORA_W", "1920"))
+    H = int(os.environ.get("VISORA_H", "1080"))
+    FPS = int(os.environ.get("VISORA_FPS", "30"))
 
-        # reduce latency / buffering
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+    # MJPG -> decode -> BGR for OpenCV
+    gst = (
+        f"v4l2src device={dev} io-mode=2 ! "
+        f"image/jpeg,width={W},height={H},framerate={FPS}/1 ! "
+        f"jpegdec ! videoconvert ! "
+        f"video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false"
+    )
 
-        # try to shorten OpenCV timeouts (works on newer OpenCV builds)
-        try:
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
-        except Exception:
-            pass
+    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    if not cap.isOpened():
+        raise RuntimeError("Failed to open camera via GStreamer. Check that gstreamer is installed and device path is correct.")
 
-    #_try_set_manual_camera(cap) - remove for now
-
-    # Warm-up and verify (use grab/retrieve to avoid long blocking)
+    # Warm-up (grab/retrieve)
     ok = False
     last_shape = None
-    for _ in range(25):
+    for _ in range(30):
         ok_grab = cap.grab()
         if not ok_grab:
             time.sleep(0.05)
@@ -254,16 +253,11 @@ def open_cam():
         time.sleep(0.05)
 
     if not ok:
-        try:
-            cap.release()
-        except Exception:
-            pass
-        raise RuntimeError(f"Camera did not return frames from {os.environ.get('VISORA_CAM_DEV','/dev/video0')}")
+        cap.release()
+        raise RuntimeError(f"GStreamer camera opened but did not deliver frames from {dev}")
 
-    if last_shape is not None:
-        h, w = last_shape[:2]
-        print(f"[Camera] OK: {w}x{h}")
-
+    h, w = last_shape[:2]
+    print(f"[Camera] GStreamer OK: {w}x{h} @ {FPS}fps ({dev})")
     return cap
 
 # =========================
