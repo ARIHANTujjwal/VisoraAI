@@ -327,7 +327,6 @@ class FrameGrabber:
                 fails = 0
             else:
                 fails += 1
-                # if camera stalls for ~1 sec, reopen it
                 if fails >= 30:
                     print("[Camera] stalled -> reopening")
                     if self.speaker:
@@ -541,54 +540,88 @@ def detect_page_rect(frame_bgr) -> Optional[Tuple[int, int, int, int]]:
 
 
 def detect_text_block_rect(page_bgr) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Finds a bounding box that covers *all* text on the page by unioning multiple
+    detected text contours (instead of picking only the single largest one).
+    """
     gray = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2GRAY)
 
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(10, 10))
     gray = clahe.apply(gray)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (19, 19))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
 
     bh_blur = cv2.GaussianBlur(blackhat, (3, 3), 0)
     _, bw = cv2.threshold(bh_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5)), iterations=2)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (35, 9)), iterations=1)
+    bw = cv2.morphologyEx(
+        bw, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (31, 7)),
+        iterations=2
+    )
+    bw = cv2.morphologyEx(
+        bw, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (41, 13)),
+        iterations=1
+    )
 
     cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
 
     H, W = gray.shape[:2]
-    best = None
-    best_area = 0
+
+    boxes = []
+    min_area = 0.0025 * (W * H)
+    min_w = 0.15 * W
+    min_h = 0.02 * H
 
     for c in cnts:
         x, y, ww, hh = cv2.boundingRect(c)
         area = ww * hh
-        if area < best_area:
-            continue
-        if area < 0.01 * (W * H):
-            continue
-        if ww > 0.98 * W and hh > 0.98 * H:
-            continue
-        best_area = area
-        best = (x, y, ww, hh)
 
-    if best is None:
+        if area < min_area:
+            continue
+        if ww < min_w and area < (0.01 * W * H):
+            continue
+        if hh < min_h:
+            continue
+        if ww > 0.99 * W and hh > 0.99 * H:
+            continue
+
+        boxes.append((x, y, ww, hh))
+
+    if not boxes:
+        x, y, ww, hh = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+        boxes = [(x, y, ww, hh)]
+
+    x1 = min(x for x, y, ww, hh in boxes)
+    y1 = min(y for x, y, ww, hh in boxes)
+    x2 = max(x + ww for x, y, ww, hh in boxes)
+    y2 = max(y + hh for x, y, ww, hh in boxes)
+
+    pad_x = int(0.04 * W)
+    pad_y = int(0.04 * H)
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(W, x2 + pad_x)
+    y2 = min(H, y2 + pad_y)
+
+    ww = x2 - x1
+    hh = y2 - y1
+    if ww <= 0 or hh <= 0:
         return None
 
-    x, y, ww, hh = best
-    pad_x = int(0.03 * W)
-    pad_y = int(0.03 * H)
-    x = max(0, x - pad_x)
-    y = max(0, y - pad_y)
-    ww = min(W - x, ww + 2 * pad_x)
-    hh = min(H - y, hh + 2 * pad_y)
-    return (x, y, ww, hh)
+    return (x1, y1, ww, hh)
 
 
 def crop_full_text_block(frame_bgr) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+    """
+    Returns:
+      crop_bgr: best guess crop containing ALL text on the page
+      rect: (x1,y1,x2,y2) in original frame coords
+    """
     page_rect = detect_page_rect(frame_bgr)
     if page_rect is None:
         return None, None
@@ -658,17 +691,28 @@ def crop_union_of_word_boxes_tight(
 # Enhancement + Median stack
 # =========================
 def enhance_text_crop_to_gray(crop_bgr: np.ndarray) -> np.ndarray:
-    crop_bgr = cv2.resize(crop_bgr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    h, w = crop_bgr.shape[:2]
+    area = h * w
+
+    # If the crop is small, upscale more (ONLY then)
+    if area < 220_000:
+        scale = 5.0
+    elif area < 500_000:
+        scale = 4.0
+    else:
+        scale = 3.0
+
+    crop_bgr = cv2.resize(crop_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
     L, _, _ = cv2.split(lab)
 
-    clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(10, 10))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(10, 10))
     L = clahe.apply(L)
 
     L = cv2.bilateralFilter(L, d=5, sigmaColor=50, sigmaSpace=50)
     blur = cv2.GaussianBlur(L, (0, 0), 1.0)
-    L = cv2.addWeighted(L, 1.9, blur, -0.9, 0)
+    L = cv2.addWeighted(L, 1.8, blur, -0.8, 0)
     return L
 
 
@@ -846,7 +890,7 @@ def distance_guide_from_crop(crop: np.ndarray, frame_shape) -> str:
     fh, fw = frame_shape[:2]
     ch, cw = crop.shape[:2]
     ratio = (cw * ch) / float(fw * fh)
-    if ratio < 0.12:
+    if ratio < 0.06:
         return "Move closer"
     if ratio > 0.85:
         return "Move farther"
@@ -872,10 +916,8 @@ def main():
 
     speaker.say("Visora AI is starting.", force=True)
 
-    # Open camera FIRST (prevents scan/quit confusion if camera stalls)
     grabber = FrameGrabber(open_cam, speaker=speaker)
 
-    # Start console AFTER camera is ready
     console = ConsoleControls()
 
     speaker.say("Visora AI is ready.", force=True)
@@ -898,8 +940,6 @@ def main():
     stable_count = 0
     last_spoken_guide = None
     REQUIRED_STABLE = 10
-
-    BLUR_MIN = 45.0
 
     scanning = False
     scan_requested = False
@@ -951,9 +991,16 @@ def main():
             else:
                 sharp = blur_score(crop)
                 over = overexposure_fraction(crop)
+
+                # Adaptive blur requirement: tiny crops are harsher -> slightly lower requirement
+                fh, fw = frame.shape[:2]
+                ch, cw = crop.shape[:2]
+                crop_ratio = (cw * ch) / float(fw * fh)
+                blur_min = 45.0 if crop_ratio >= 0.06 else 35.0
+
                 if over > 0.35:
                     guide = "Tilt page to remove glare"
-                elif sharp < BLUR_MIN:
+                elif sharp < blur_min:
                     guide = "Hold steady"
                 else:
                     guide = distance_guide_from_crop(crop, frame.shape)
@@ -1015,6 +1062,21 @@ def main():
             if best_crop is None or super_gray is None:
                 best_crop, best_rect, super_gray = capture_best_text_via_box_data_from_grabber(grabber, seconds=1.25, max_frames=34)
 
+            # If the crop is tiny, expand to the whole detected page (more pixels for OCR)
+            if best_crop is not None:
+                ch, cw = best_crop.shape[:2]
+                fh, fw = frame.shape[:2]
+                crop_ratio = (cw * ch) / float(fw * fh)
+
+                if crop_ratio < 0.06:
+                    page_rect = detect_page_rect(frame)
+                    if page_rect is not None:
+                        px, py, pw, ph = page_rect
+                        page_crop = frame[py:py + ph, px:px + pw]
+                        if page_crop is not None and page_crop.size > 0:
+                            best_crop = page_crop
+                            super_gray = enhance_text_crop_to_gray(best_crop)
+
             if best_rect is not None and last_processed is not None:
                 x1, y1, x2, y2 = best_rect
                 cv2.rectangle(last_processed, (x1, y1), (x2, y2), (0, 255, 0), 3)
@@ -1028,7 +1090,14 @@ def main():
                 speaker.say("Too much glare. Tilt the page slightly.", force=True)
                 continue
 
-            if blur_score(best_crop) < 55:
+            # Adaptive blur requirement for scan result too
+            sharp = blur_score(best_crop)
+            fh, fw = frame.shape[:2]
+            ch, cw = best_crop.shape[:2]
+            crop_ratio = (cw * ch) / float(fw * fh)
+            min_sharp = 55.0 if crop_ratio >= 0.06 else 40.0
+
+            if sharp < min_sharp:
                 speaker.say("Too blurry. Hold steadier or move slightly farther.", force=True)
                 continue
 
@@ -1076,7 +1145,6 @@ def main():
             except Exception:
                 pass
 
-            # optional keyboard fallback for local testing
             try:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("s"):
