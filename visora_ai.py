@@ -205,6 +205,13 @@ def _try_set_manual_camera(cap: cv2.VideoCapture):
 
 
 def open_cam():
+    """
+    Reliable V4L2 open for Pi USB cams.
+    Default: /dev/video0, MJPG, 1280x720@30 (less likely to stall than 1080p).
+    You can override with:
+      VISORA_CAM_DEV=/dev/video0
+      VISORA_W=1920 VISORA_H=1080 VISORA_FPS=30
+    """
     if sys.platform == "darwin":
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -213,15 +220,19 @@ def open_cam():
         return cap
 
     dev = os.environ.get("VISORA_CAM_DEV", "/dev/video0")
+    W = int(os.environ.get("VISORA_W", "1280"))
+    H = int(os.environ.get("VISORA_H", "720"))
+    FPS = int(os.environ.get("VISORA_FPS", "30"))
+
     cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
 
-    # Force MJPG
+    # Force MJPG (important for USB cams at higher res)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
 
-    # Reduce buffering
+    # Reduce buffering/latency
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
@@ -229,23 +240,126 @@ def open_cam():
 
     _try_set_manual_camera(cap)
 
-    # Warm-up and verify
+    # Warm up with grab/retrieve (often more stable than read)
     ok = False
     last = None
-    for _ in range(50):
-        ret, frame = cap.read()
-        if ret and frame is not None and frame.size > 0:
-            ok = True
-            last = frame
-            break
-        time.sleep(0.05)
+    for _ in range(60):
+        if cap.grab():
+            ok, last = cap.retrieve()
+            if ok and last is not None and last.size > 0:
+                break
+        time.sleep(0.03)
 
     if not ok:
         cap.release()
         raise RuntimeError(f"Camera did not deliver frames from {dev}")
 
-    print(f"[Camera] V4L2 OK: {last.shape[1]}x{last.shape[0]}")
+    print(f"[Camera] OK: {last.shape[1]}x{last.shape[0]} via {dev}")
     return cap
+
+
+class FrameGrabber:
+    """
+    Continuously grabs frames on a background thread so the main loop never blocks.
+    Fixes 'select() timeout' symptoms by preventing the main thread from blocking on read().
+    """
+    def __init__(self, open_fn, speaker=None):
+        self.open_fn = open_fn
+        self.speaker = speaker
+
+        self.cap = None
+        self.lock = threading.Lock()
+
+        self.latest = None
+        self.latest_time = 0.0
+        self.latest_seq = 0
+
+        self.stop_flag = False
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _open(self):
+        try:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+            self.cap = self.open_fn()
+            return True
+        except Exception as e:
+            print("[Camera] open failed:", e)
+            return False
+
+    def _loop(self):
+        backoff = 0.2
+        if not self._open():
+            time.sleep(1.0)
+
+        fails = 0
+        while not self.stop_flag:
+            if self.cap is None or not self.cap.isOpened():
+                if self._open():
+                    fails = 0
+                    backoff = 0.2
+                else:
+                    time.sleep(min(2.0, backoff))
+                    backoff = min(2.0, backoff * 1.5)
+                continue
+
+            ok = False
+            frame = None
+
+            # grab/retrieve is often more stable than read() on V4L2
+            try:
+                if self.cap.grab():
+                    ok, frame = self.cap.retrieve()
+            except Exception:
+                ok = False
+                frame = None
+
+            if ok and frame is not None and frame.size > 0:
+                with self.lock:
+                    self.latest = frame
+                    self.latest_time = time.time()
+                    self.latest_seq += 1
+                fails = 0
+            else:
+                fails += 1
+                # if camera stalls for ~1 sec, reopen it
+                if fails >= 30:
+                    print("[Camera] stalled -> reopening")
+                    if self.speaker:
+                        try:
+                            self.speaker.say("Camera reconnecting.", force=True)
+                        except Exception:
+                            pass
+                    self._open()
+                    fails = 0
+                time.sleep(0.03)
+
+    def get(self, max_age_sec=0.7):
+        with self.lock:
+            f = self.latest
+            t = self.latest_time
+            s = self.latest_seq
+        if f is None:
+            return None, 0, 0.0
+        if (time.time() - t) > max_age_sec:
+            return None, 0, 0.0
+        return f, s, t
+
+    def stop(self):
+        self.stop_flag = True
+        try:
+            self.thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
 
 
 # =========================
@@ -567,6 +681,103 @@ def median_stack(grays: List[np.ndarray]) -> Optional[np.ndarray]:
     stack = np.stack(arr, axis=0)
     return np.median(stack, axis=0).astype(np.uint8)
 
+def _grabber_next_frame(grabber: FrameGrabber, last_seq: int, timeout_sec: float = 0.6):
+    """
+    Waits briefly for a *new* frame (seq changes). Returns (frame, seq) or (None, last_seq).
+    """
+    t0 = time.time()
+    while (time.time() - t0) < timeout_sec:
+        frame, seq, _ = grabber.get(max_age_sec=0.9)
+        if frame is not None and seq != last_seq:
+            return frame, seq
+        time.sleep(0.01)
+    return None, last_seq
+
+
+def capture_best_text_block_from_grabber(grabber: FrameGrabber, seconds: float = 1.25, max_frames: int = 34):
+    start = time.time()
+    best_crop = None
+    best_rect = None
+    best_score = -1e18
+    gray_pool: List[np.ndarray] = []
+
+    last_seq = 0
+
+    while (time.time() - start) < seconds and max_frames > 0:
+        max_frames -= 1
+        frame, last_seq = _grabber_next_frame(grabber, last_seq, timeout_sec=0.5)
+        if frame is None:
+            continue
+
+        crop, rect = crop_full_text_block(frame)
+        if crop is None:
+            continue
+
+        sharp = blur_score(crop)
+        over = overexposure_fraction(crop)
+        if over > 0.35 or sharp < 45:
+            continue
+
+        gray = enhance_text_crop_to_gray(crop)
+        gray_pool.append(gray)
+        if len(gray_pool) > 13:
+            gray_pool.pop(0)
+
+        h, w = crop.shape[:2]
+        score = min(sharp, 3200.0) + (w * h) * 1e-5 - (over * 1800.0)
+
+        if score > best_score:
+            best_score = score
+            best_crop = crop
+            best_rect = rect
+
+    super_gray = median_stack(gray_pool)
+    return best_crop, best_rect, super_gray
+
+
+def capture_best_text_via_box_data_from_grabber(grabber: FrameGrabber, seconds: float = 1.25, max_frames: int = 34):
+    start = time.time()
+    best_crop = None
+    best_rect = None
+    best_score = -1e18
+    gray_pool: List[np.ndarray] = []
+
+    last_seq = 0
+
+    while (time.time() - start) < seconds and max_frames > 0:
+        max_frames -= 1
+        frame, last_seq = _grabber_next_frame(grabber, last_seq, timeout_sec=0.5)
+        if frame is None:
+            continue
+
+        _, text_detected, _, _, _, word_boxes = detect_text_and_draw_box(frame)
+        if not text_detected or not word_boxes:
+            continue
+
+        crop, rect = crop_union_of_word_boxes_tight(frame, word_boxes, pad=14, trim_quantile=0.10)
+        if crop is None:
+            continue
+
+        sharp = blur_score(crop)
+        over = overexposure_fraction(crop)
+        if over > 0.35 or sharp < 45:
+            continue
+
+        gray = enhance_text_crop_to_gray(crop)
+        gray_pool.append(gray)
+        if len(gray_pool) > 13:
+            gray_pool.pop(0)
+
+        n = len(word_boxes)
+        score = (n * 1200.0) + min(sharp, 2600.0) - (over * 1500.0)
+
+        if score > best_score:
+            best_score = score
+            best_crop = crop
+            best_rect = rect
+
+    super_gray = median_stack(gray_pool)
+    return best_crop, best_rect, super_gray
 
 # =========================
 # Burst scan (ADD tiny sleeps on failed reads)
@@ -744,7 +955,7 @@ def main():
 
     # Open camera FIRST (prevents scan/quit confusion if camera stalls)
     try:
-        cap = open_cam()
+        grabber = FrameGrabber(open_cam, speaker=speaker)
     except Exception as e:
         print(f"[Camera] Failed to open: {e}")
         speaker.say("Camera failed to open.", force=True)
@@ -800,27 +1011,11 @@ def main():
         if console.consume_scan():
             scan_requested = True
 
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            consecutive_fail += 1
+        frame = grabber.get(max_age_sec=0.7)
+        if frame is None:
+            # no fresh frame yet; don’t block, just loop
             time.sleep(0.02)
-            if consecutive_fail >= MAX_FAIL:
-                print("[Camera] Reopening camera after repeated read failures...")
-                speaker.say("Camera reconnecting.", rate=175)
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                time.sleep(0.2)
-                try:
-                    cap = open_cam()
-                    consecutive_fail = 0
-                except Exception as e:
-                    print(f"[Camera] Reopen failed: {e}")
-                    time.sleep(0.5)
             continue
-
-        consecutive_fail = 0
 
         frame_idx += 1
 
@@ -904,9 +1099,14 @@ def main():
             last_scan_time = time.time()
             speaker.say("Reading.", force=True)
 
-            best_crop, best_rect, super_gray = capture_best_text_block(cap, seconds=1.25, max_frames=34)
+            best_crop, best_rect, super_gray = capture_best_text_block_from_grabber(grabber, seconds=1.25, max_frames=34)
             if best_crop is None or super_gray is None:
-                best_crop, best_rect, super_gray = capture_best_text_via_box_data(cap, seconds=1.25, max_frames=34)
+                best_crop, best_rect, super_gray = capture_best_text_via_box_data_from_grabber(grabber, seconds=1.25, max_frames=34)
+
+            if best_rect is not None and last_processed is not None:
+                x1, y1, x2, y2 = best_rect
+                cv2.rectangle(last_processed, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                display_frame = last_processed    
 
             if best_crop is None or super_gray is None:
                 speaker.say("I can't see text yet. Move closer and aim at the paragraph.", force=True)
@@ -975,7 +1175,7 @@ def main():
                 pass
 
     try:
-        cap.release()
+        grabber.stop()
     except Exception:
         pass
 
