@@ -1,4 +1,4 @@
-# visora_ai.py (Pi demo-safe, QuickTime HDMI friendly)
+# visora_ai.py (Pi demo-safe, QuickTime HDMI friendly, V4L2 stable)
 #
 # Controls (type in terminal):
 #   scan  -> capture burst + OCR + speak
@@ -10,7 +10,7 @@
 #   This script auto-sets DISPLAY=:0 if it looks missing, unless VISORA_HEADLESS=1.
 #
 # Camera:
-#   Uses /dev/video0 explicitly (Arducam_8mp) and forces MJPG @ 1280x720 30fps.
+#   Uses /dev/video0 explicitly and forces MJPG @ 1920x1080 30fps.
 
 import cv2
 import time
@@ -171,7 +171,6 @@ def ensure_pi_desktop_display_if_needed(headless: bool) -> bool:
         os.environ["DISPLAY"] = ":0"
         disp = ":0"
 
-    # If user explicitly wants a different display, let them override
     if os.environ.get("VISORA_FORCE_DISPLAY", "1") == "1":
         os.environ["DISPLAY"] = ":0"
 
@@ -213,7 +212,6 @@ def open_cam():
         cap.set(cv2.CAP_PROP_FPS, 30)
         return cap
 
-    # ---------- Raspberry Pi ----------
     dev = os.environ.get("VISORA_CAM_DEV", "/dev/video0")
     cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
 
@@ -223,18 +221,22 @@ def open_cam():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
-    # Reduce buffering (important)
+    # Reduce buffering
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
         pass
 
+    _try_set_manual_camera(cap)
+
     # Warm-up and verify
     ok = False
-    for _ in range(40):
+    last = None
+    for _ in range(50):
         ret, frame = cap.read()
         if ret and frame is not None and frame.size > 0:
             ok = True
+            last = frame
             break
         time.sleep(0.05)
 
@@ -242,8 +244,9 @@ def open_cam():
         cap.release()
         raise RuntimeError(f"Camera did not deliver frames from {dev}")
 
-    print(f"[Camera] V4L2 OK: {frame.shape[1]}x{frame.shape[0]}")
+    print(f"[Camera] V4L2 OK: {last.shape[1]}x{last.shape[0]}")
     return cap
+
 
 # =========================
 # Metrics
@@ -566,7 +569,7 @@ def median_stack(grays: List[np.ndarray]) -> Optional[np.ndarray]:
 
 
 # =========================
-# Burst scan
+# Burst scan (ADD tiny sleeps on failed reads)
 # =========================
 def capture_best_text_block(cap, seconds: float = 1.25, max_frames: int = 34):
     start = time.time()
@@ -579,6 +582,7 @@ def capture_best_text_block(cap, seconds: float = 1.25, max_frames: int = 34):
         max_frames -= 1
         ret, frame = cap.read()
         if not ret or frame is None:
+            time.sleep(0.01)
             continue
 
         crop, rect = crop_full_text_block(frame)
@@ -587,7 +591,6 @@ def capture_best_text_block(cap, seconds: float = 1.25, max_frames: int = 34):
 
         sharp = blur_score(crop)
         over = overexposure_fraction(crop)
-
         if over > 0.35 or sharp < 45:
             continue
 
@@ -619,6 +622,7 @@ def capture_best_text_via_box_data(cap, seconds: float = 1.25, max_frames: int =
         max_frames -= 1
         ret, frame = cap.read()
         if not ret or frame is None:
+            time.sleep(0.01)
             continue
 
         _, text_detected, _, _, _, word_boxes = detect_text_and_draw_box(frame)
@@ -726,7 +730,6 @@ def main():
     HEADLESS = os.environ.get("VISORA_HEADLESS", "0") == "1"
     DEBUG_SAVE = os.environ.get("VISORA_DEBUG", "0") == "1"
 
-    # Auto-scan OFF by default (demo stability)
     AUTO_SCAN = os.environ.get("VISORA_AUTOSCAN", "0") == "1"
     AUTO_SCAN_STABLE_SECS = float(os.environ.get("VISORA_AUTOSCAN_STABLE_SECS", "1.1"))
     AUTO_SCAN_COOLDOWN_SECS = float(os.environ.get("VISORA_AUTOSCAN_COOLDOWN_SECS", "4.0"))
@@ -735,8 +738,20 @@ def main():
 
     WINDOW_NAME = "VisoraAI - Live (terminal scan/quit)"
     speaker = SpeechManager(default_rate=175, min_gap=2.0)
-    console = ConsoleControls()
     have_tess = tesseract_available()
+
+    speaker.say("Visora AI is starting.", force=True)
+
+    # Open camera FIRST (prevents scan/quit confusion if camera stalls)
+    try:
+        cap = open_cam()
+    except Exception as e:
+        print(f"[Camera] Failed to open: {e}")
+        speaker.say("Camera failed to open.", force=True)
+        return
+
+    # Start console AFTER camera is ready
+    console = ConsoleControls()
 
     speaker.say("Visora AI is ready.", force=True)
     speaker.say("Type scan to read. Type quit to exit.", force=True)
@@ -747,14 +762,6 @@ def main():
         speaker.say("Using Tesseract fallback.", force=True)
     else:
         speaker.say("No OCR engine found.", force=True)
-
-    # Open camera (reopen on failure)
-    try:
-        cap = open_cam()
-    except Exception as e:
-        print(f"[Camera] Failed to open: {e}")
-        speaker.say("Camera failed to open.", force=True)
-        return
 
     if not HEADLESS:
         try:
@@ -772,7 +779,7 @@ def main():
     scanning = False
     scan_requested = False
     scan_start = 0.0
-    SCAN_HOLD_SECONDS = 0.25  # quick reaction for terminal-trigger demo
+    SCAN_HOLD_SECONDS = 0.25
 
     guide = "Point at the page"
     last_processed = None
@@ -783,7 +790,6 @@ def main():
     autoscan_t0 = None
     last_scan_time = 0.0
 
-    # If we can't read frames for a while, reopen camera
     consecutive_fail = 0
     MAX_FAIL = 40
 
@@ -795,12 +801,12 @@ def main():
             scan_requested = True
 
         ret, frame = cap.read()
-
         if not ret or frame is None:
             consecutive_fail += 1
-            time.sleep(0.02)  # tiny delay prevents CPU spin & blocking
+            time.sleep(0.02)
             if consecutive_fail >= MAX_FAIL:
                 print("[Camera] Reopening camera after repeated read failures...")
+                speaker.say("Camera reconnecting.", rate=175)
                 try:
                     cap.release()
                 except Exception:
@@ -899,7 +905,6 @@ def main():
             speaker.say("Reading.", force=True)
 
             best_crop, best_rect, super_gray = capture_best_text_block(cap, seconds=1.25, max_frames=34)
-
             if best_crop is None or super_gray is None:
                 best_crop, best_rect, super_gray = capture_best_text_via_box_data(cap, seconds=1.25, max_frames=34)
 
