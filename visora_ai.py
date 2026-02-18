@@ -1,11 +1,16 @@
-# visora_ai.py (Pi demo-safe)
-# Control the demo from the Raspberry Pi terminal (SSH from your Mac):
-#   - type:  scan   -> trigger OCR + speech
-#   - type:  quit   -> exit cleanly
-#   - type:  help   -> commands
+# visora_ai.py (Pi demo-safe, QuickTime HDMI friendly)
 #
-# GUI keyboard (s/q) still works if you have focus, but you DO NOT need it.
-# Auto-scan is OFF by default (you can enable with VISORA_AUTOSCAN=1).
+# Controls (type in terminal):
+#   scan  -> capture burst + OCR + speak
+#   quit  -> exit
+#   help  -> show commands
+#
+# Display:
+#   When SSH'd in, OpenCV windows won't appear unless DISPLAY is set to the Pi desktop (:0).
+#   This script auto-sets DISPLAY=:0 if it looks missing, unless VISORA_HEADLESS=1.
+#
+# Camera:
+#   Uses /dev/video0 explicitly (Arducam_8mp) and forces MJPG @ 1280x720 30fps.
 
 import cv2
 import time
@@ -26,7 +31,7 @@ if str(BASE_DIR) not in sys.path:
 from box_data import detect_text_and_draw_box
 from text_to_audio import convert_text_to_audio
 
-# Try to use your old OCR module (the one that used to work)
+# Try old OCR module
 try:
     from pic_to_text import perform_ocr  # perform_ocr(image)->(text,conf?) or text
     HAVE_PERFORM_OCR = True
@@ -34,7 +39,7 @@ except Exception:
     perform_ocr = None
     HAVE_PERFORM_OCR = False
 
-# Optional: accuracy helper
+# Optional accuracy helper
 try:
     import accuracy as accuracy_mod
     HAVE_ACCURACY = True
@@ -146,6 +151,34 @@ class SpeechManager:
 
 
 # =========================
+# Display helpers (Pi HDMI)
+# =========================
+def ensure_pi_desktop_display_if_needed(headless: bool) -> bool:
+    """
+    If we're not headless and DISPLAY isn't set, force DISPLAY=:0 so OpenCV windows
+    show up on the Pi desktop (HDMI output -> capture card -> QuickTime).
+    """
+    if headless:
+        return True
+
+    disp = os.environ.get("DISPLAY", "").strip()
+    if disp == "":
+        os.environ["DISPLAY"] = ":0"
+        disp = ":0"
+
+    # If DISPLAY is set but points to SSH forwarding, force :0 for the real desktop
+    if disp.startswith("localhost:") or disp.startswith("127.0.0.1:"):
+        os.environ["DISPLAY"] = ":0"
+        disp = ":0"
+
+    # If user explicitly wants a different display, let them override
+    if os.environ.get("VISORA_FORCE_DISPLAY", "1") == "1":
+        os.environ["DISPLAY"] = ":0"
+
+    return True
+
+
+# =========================
 # Camera
 # =========================
 def _try_set_manual_camera(cap: cv2.VideoCapture):
@@ -172,26 +205,47 @@ def _try_set_manual_camera(cap: cv2.VideoCapture):
             pass
 
 
-def open_cam(index: int = 0):
+def open_cam():
+    """
+    Uses explicit device path for reliability on Pi.
+    Default: /dev/video0 (your Arducam_8mp).
+    """
     if sys.platform == "darwin":
-        cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
     else:
-        cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-        try:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        except Exception:
-            pass
+        dev = os.environ.get("VISORA_CAM_DEV", "/dev/video0")
+        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
 
-    # 720p is a good speed/quality point on Pi 5
+        # Force MJPG (your device supports MJPG 1280x720@30)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     _try_set_manual_camera(cap)
 
-    # Warm-up reads so width/height are valid
-    for _ in range(8):
-        cap.read()
+    # Warm-up and verify
+    ok = False
+    last_shape = None
+    for _ in range(25):
+        ret, frame = cap.read()
+        if ret and frame is not None and frame.size > 0:
+            last_shape = frame.shape
+            ok = True
+            break
+        time.sleep(0.05)
+
+    if not ok:
+        try:
+            cap.release()
+        except Exception:
+            pass
+        raise RuntimeError(f"Camera did not return frames from {os.environ.get('VISORA_CAM_DEV','/dev/video0')}")
+
+    if last_shape is not None:
+        h, w = last_shape[:2]
+        print(f"[Camera] OK: {w}x{h}")
 
     return cap
 
@@ -221,9 +275,6 @@ def tesseract_available() -> bool:
 
 
 def _run_tesseract_tsv(gray: np.ndarray, psm: int = 6) -> Tuple[str, float, int]:
-    """
-    Returns: (clean_text, avg_conf, nwords)
-    """
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
             cv2.imwrite(tmp.name, gray)
@@ -278,11 +329,7 @@ def _run_tesseract_tsv(gray: np.ndarray, psm: int = 6) -> Tuple[str, float, int]
             except Exception:
                 continue
 
-            if c < 0:
-                continue
-            if c < HARD_REJECT:
-                continue
-            if c < OK:
+            if c < 0 or c < HARD_REJECT or c < OK:
                 continue
 
             par = cols[par_idx] if par_idx is not None and par_idx < len(cols) else "0"
@@ -403,14 +450,12 @@ def detect_text_block_rect(page_bgr) -> Optional[Tuple[int, int, int, int]]:
     for c in cnts:
         x, y, ww, hh = cv2.boundingRect(c)
         area = ww * hh
-
         if area < best_area:
             continue
         if area < 0.01 * (W * H):
             continue
         if ww > 0.98 * W and hh > 0.98 * H:
             continue
-
         best_area = area
         best = (x, y, ww, hh)
 
@@ -530,11 +575,9 @@ def median_stack(grays: List[np.ndarray]) -> Optional[np.ndarray]:
 # =========================
 def capture_best_text_block(cap, seconds: float = 1.25, max_frames: int = 34):
     start = time.time()
-
     best_crop = None
     best_rect = None
     best_score = -1e18
-
     gray_pool: List[np.ndarray] = []
 
     while (time.time() - start) < seconds and max_frames > 0:
@@ -572,11 +615,9 @@ def capture_best_text_block(cap, seconds: float = 1.25, max_frames: int = 34):
 
 def capture_best_text_via_box_data(cap, seconds: float = 1.25, max_frames: int = 34):
     start = time.time()
-
     best_crop = None
     best_rect = None
     best_score = -1e18
-
     gray_pool: List[np.ndarray] = []
 
     while (time.time() - start) < seconds and max_frames > 0:
@@ -687,14 +728,15 @@ def distance_guide_from_crop(crop: np.ndarray, frame_shape) -> str:
 # Main
 # =========================
 def main():
-    # If GUI breaks, set VISORA_HEADLESS=1
     HEADLESS = os.environ.get("VISORA_HEADLESS", "0") == "1"
     DEBUG_SAVE = os.environ.get("VISORA_DEBUG", "0") == "1"
 
-    # Auto-scan is OFF by default (you can enable with VISORA_AUTOSCAN=1)
+    # Auto-scan OFF by default (demo stability)
     AUTO_SCAN = os.environ.get("VISORA_AUTOSCAN", "0") == "1"
     AUTO_SCAN_STABLE_SECS = float(os.environ.get("VISORA_AUTOSCAN_STABLE_SECS", "1.1"))
     AUTO_SCAN_COOLDOWN_SECS = float(os.environ.get("VISORA_AUTOSCAN_COOLDOWN_SECS", "4.0"))
+
+    ensure_pi_desktop_display_if_needed(HEADLESS)
 
     WINDOW_NAME = "VisoraAI - Live (terminal scan/quit)"
     speaker = SpeechManager(default_rate=175, min_gap=2.0)
@@ -705,14 +747,19 @@ def main():
     speaker.say("Type scan to read. Type quit to exit.", force=True)
 
     if HAVE_PERFORM_OCR:
-        speaker.say("Using your perform OCR pipeline.", force=True)
+        speaker.say("Using perform OCR pipeline.", force=True)
     elif have_tess:
-        speaker.say("perform OCR not found. Using Tesseract fallback.", force=True)
+        speaker.say("Using Tesseract fallback.", force=True)
     else:
         speaker.say("No OCR engine found.", force=True)
 
-    CAM_INDEX = 0
-    cap = open_cam(CAM_INDEX)
+    # Open camera (reopen on failure)
+    try:
+        cap = open_cam()
+    except Exception as e:
+        print(f"[Camera] Failed to open: {e}")
+        speaker.say("Camera failed to open.", force=True)
+        return
 
     if not HEADLESS:
         try:
@@ -730,7 +777,7 @@ def main():
     scanning = False
     scan_requested = False
     scan_start = 0.0
-    SCAN_HOLD_SECONDS = 0.25  # fast response for terminal-trigger demo
+    SCAN_HOLD_SECONDS = 0.25  # quick reaction for terminal-trigger demo
 
     guide = "Point at the page"
     last_processed = None
@@ -741,46 +788,54 @@ def main():
     autoscan_t0 = None
     last_scan_time = 0.0
 
+    # If we can't read frames for a while, reopen camera
+    consecutive_fail = 0
+    MAX_FAIL = 40
+
     while True:
-        # Terminal quit
         if console.should_quit():
             break
 
-        # Terminal scan
         if console.consume_scan():
             scan_requested = True
 
         ret, frame = cap.read()
         if not ret or frame is None:
-            speaker.say("Camera reconnecting.", rate=175)
-            time.sleep(0.4)
-            try:
-                cap.release()
-            except Exception:
-                pass
-            cap = open_cam(CAM_INDEX)
+            consecutive_fail += 1
+            if consecutive_fail >= MAX_FAIL:
+                print("[Camera] Reopening camera after repeated read failures...")
+                speaker.say("Camera reconnecting.", rate=175)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                time.sleep(0.2)
+                try:
+                    cap = open_cam()
+                    consecutive_fail = 0
+                except Exception as e:
+                    print(f"[Camera] Reopen failed: {e}")
+                    time.sleep(0.5)
             continue
+
+        consecutive_fail = 0
 
         frame_idx += 1
 
         if frame_idx % DETECT_EVERY_N_FRAMES == 0:
             processed = frame.copy()
 
-            # Primary crop = full text block
             crop, rect = crop_full_text_block(frame)
 
-            # Fallback: union of word boxes from box_data
             if crop is None:
                 _, text_detected, _, _, _, word_boxes = detect_text_and_draw_box(frame)
                 if text_detected and word_boxes:
                     crop, rect = crop_union_of_word_boxes_tight(frame, word_boxes, pad=14, trim_quantile=0.10)
 
-            # Draw rectangle
             if rect is not None:
                 x1, y1, x2, y2 = rect
                 cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 255), 3)
 
-            # Guidance
             good_for_scan = False
             if crop is None:
                 guide = "Point at the page"
@@ -794,11 +849,9 @@ def main():
                 else:
                     guide = distance_guide_from_crop(crop, frame.shape)
 
-                # Strictly "good" conditions (used only for optional autoscan)
                 if guide == "Good distance" and sharp >= 60 and over <= 0.20:
                     good_for_scan = True
 
-            # Speak stable guidance occasionally
             if guide == stable_guide:
                 stable_count += 1
             else:
@@ -809,7 +862,6 @@ def main():
                 speaker.say(guide, rate=185)
                 last_spoken_guide = guide
 
-            # Optional autoscan (OFF by default)
             now = time.time()
             if AUTO_SCAN and not scanning and not scan_requested:
                 if (now - last_scan_time) >= AUTO_SCAN_COOLDOWN_SECS:
@@ -826,7 +878,6 @@ def main():
             else:
                 autoscan_t0 = None
 
-            # Debug OCR thumbnail
             try:
                 if crop is not None:
                     dbg_gray = enhance_text_crop_to_gray(crop)
@@ -840,14 +891,12 @@ def main():
 
         display_frame = last_processed if last_processed is not None else frame
 
-        # Start scan
         if scan_requested and not scanning:
             scanning = True
             scan_requested = False
             scan_start = time.time()
             speaker.say("Hold steady.", force=True)
 
-        # Execute scan
         if scanning and (time.time() - scan_start) >= SCAN_HOLD_SECONDS:
             scanning = False
             last_scan_time = time.time()
@@ -855,7 +904,6 @@ def main():
 
             best_crop, best_rect, super_gray = capture_best_text_block(cap, seconds=1.25, max_frames=34)
 
-            # fallback: if page/textblock fails, use box_data burst
             if best_crop is None or super_gray is None:
                 best_crop, best_rect, super_gray = capture_best_text_via_box_data(cap, seconds=1.25, max_frames=34)
 
@@ -876,7 +924,6 @@ def main():
                 cv2.imwrite(str(BASE_DIR / "debug_super_gray.png"), super_gray)
 
             text, score = run_best_ocr(super_gray, have_tess=have_tess)
-
             print(f"[OCR] score={score:.1f} chars={len(text)}")
 
             if DEBUG_SAVE:
@@ -895,14 +942,12 @@ def main():
                 speaker.say("Not enough readable text. Move closer.", force=True)
                 continue
 
-            # If perform_ocr returns confidence, gate it here.
             if HAVE_PERFORM_OCR and score != 0.0 and score < 350:
                 speaker.say("Text is unclear. Move slightly closer and hold steady.", force=True)
                 continue
 
             speak_text_in_chunks(speaker, text, rate=175, chunk_chars=240)
 
-        # Display
         if not HEADLESS:
             try:
                 status = "SCANNING..." if scanning else "READY (type scan / quit)"
@@ -918,18 +963,15 @@ def main():
             except Exception:
                 pass
 
-        # Keyboard is optional (kept for desktop/testing)
-        key = 0
-        if not HEADLESS:
+            # optional keyboard fallback for local testing
             try:
                 key = cv2.waitKey(1) & 0xFF
+                if key == ord("s"):
+                    scan_requested = True
+                elif key == ord("q"):
+                    break
             except Exception:
-                key = 0
-
-        if key == ord("s"):
-            scan_requested = True
-        elif key == ord("q"):
-            break
+                pass
 
     try:
         cap.release()
