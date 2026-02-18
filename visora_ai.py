@@ -206,58 +206,43 @@ def _try_set_manual_camera(cap: cv2.VideoCapture):
 
 
 def open_cam():
-    """
-    Pi: Use GStreamer pipeline for stable capture (avoids OpenCV V4L2 select() timeouts).
-    Mac: use AVFoundation.
-    """
     if sys.platform == "darwin":
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         cap.set(cv2.CAP_PROP_FPS, 30)
-        _try_set_manual_camera(cap)
         return cap
 
-    # ---------- Raspberry Pi (Linux) ----------
+    # ---------- Raspberry Pi ----------
     dev = os.environ.get("VISORA_CAM_DEV", "/dev/video0")
-    W = int(os.environ.get("VISORA_W", "1920"))
-    H = int(os.environ.get("VISORA_H", "1080"))
-    FPS = int(os.environ.get("VISORA_FPS", "30"))
+    cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
 
-    # MJPG -> decode -> BGR for OpenCV
-    gst = (
-        f"v4l2src device={dev} io-mode=2 ! "
-        f"image/jpeg,width={W},height={H},framerate={FPS}/1 ! "
-        f"jpegdec ! videoconvert ! "
-        f"video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false"
-    )
+    # Force MJPG
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
-    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+    # Reduce buffering (important)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
-    if not cap.isOpened():
-        raise RuntimeError("Failed to open camera via GStreamer. Check that gstreamer is installed and device path is correct.")
-
-    # Warm-up (grab/retrieve)
+    # Warm-up and verify
     ok = False
-    last_shape = None
-    for _ in range(30):
-        ok_grab = cap.grab()
-        if not ok_grab:
-            time.sleep(0.05)
-            continue
-        ret, frame = cap.retrieve()
+    for _ in range(40):
+        ret, frame = cap.read()
         if ret and frame is not None and frame.size > 0:
-            last_shape = frame.shape
             ok = True
             break
         time.sleep(0.05)
 
     if not ok:
         cap.release()
-        raise RuntimeError(f"GStreamer camera opened but did not deliver frames from {dev}")
+        raise RuntimeError(f"Camera did not deliver frames from {dev}")
 
-    h, w = last_shape[:2]
-    print(f"[Camera] GStreamer OK: {w}x{h} @ {FPS}fps ({dev})")
+    print(f"[Camera] V4L2 OK: {frame.shape[1]}x{frame.shape[0]}")
     return cap
 
 # =========================
@@ -810,11 +795,12 @@ def main():
             scan_requested = True
 
         ret, frame = cap.read()
+
         if not ret or frame is None:
             consecutive_fail += 1
+            time.sleep(0.02)  # tiny delay prevents CPU spin & blocking
             if consecutive_fail >= MAX_FAIL:
                 print("[Camera] Reopening camera after repeated read failures...")
-                speaker.say("Camera reconnecting.", rate=175)
                 try:
                     cap.release()
                 except Exception:
