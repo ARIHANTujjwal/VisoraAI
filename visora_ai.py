@@ -219,17 +219,34 @@ def open_cam():
         # Force MJPG (your device supports MJPG 1280x720@30)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
+        # reduce latency / buffering
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        # try to shorten OpenCV timeouts (works on newer OpenCV builds)
+        try:
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
+        except Exception:
+            pass
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     _try_set_manual_camera(cap)
 
-    # Warm-up and verify
+    # Warm-up and verify (use grab/retrieve to avoid long blocking)
     ok = False
     last_shape = None
     for _ in range(25):
-        ret, frame = cap.read()
+        ok_grab = cap.grab()
+        if not ok_grab:
+            time.sleep(0.05)
+            continue
+        ret, frame = cap.retrieve()
         if ret and frame is not None and frame.size > 0:
             last_shape = frame.shape
             ok = True
@@ -248,7 +265,6 @@ def open_cam():
         print(f"[Camera] OK: {w}x{h}")
 
     return cap
-
 
 # =========================
 # Metrics
