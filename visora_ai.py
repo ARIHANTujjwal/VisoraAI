@@ -232,11 +232,11 @@ def open_cam():
         except Exception:
             pass
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
-    _try_set_manual_camera(cap)
+    #_try_set_manual_camera(cap) - remove for now
 
     # Warm-up and verify (use grab/retrieve to avoid long blocking)
     ok = False
@@ -558,7 +558,7 @@ def crop_union_of_word_boxes_tight(
 # Enhancement + Median stack
 # =========================
 def enhance_text_crop_to_gray(crop_bgr: np.ndarray) -> np.ndarray:
-    crop_bgr = cv2.resize(crop_bgr, None, fx=2.4, fy=2.4, interpolation=cv2.INTER_CUBIC)
+    crop_bgr = cv2.resize(crop_bgr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
 
     lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
     L, _, _ = cv2.split(lab)
